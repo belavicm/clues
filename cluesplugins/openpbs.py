@@ -430,8 +430,9 @@ class lrms(clueslib.platform.LRMS):
             _LOGGER.error("could not obtain information about the queues from PBS server %s (check if it is online and the user running CLUES is allowed to poll the queues)" % self._server_ip)
             return None
         
-        command = self._pbsnodes + [ '-x', '-s', self._server_ip ]
+        command = self._pbsnodes + [ '-a','-F','json', '-s', self._server_ip ]
         success, out_command = cpyutils.runcommand.runcommand(command, False, timeout = clueslib.configlib._CONFIGURATION_GENERAL.TIMEOUT_COMMANDS)
+        out_command = dicttoxml.dicttoxml(out_command)
 
         if not success:
             _LOGGER.error("could not obtain information about PBS server %s (%s)" % (self._server_ip, out_command))
