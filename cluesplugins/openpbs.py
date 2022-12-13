@@ -15,25 +15,17 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
+import json
 import clueslib.configlib
 import logging
-import clueslib.node
 import clueslib.helpers
-import cpyutils.runcommand
-from clueslib.platform import PowerManager
-from clueslib.node import Node, NodeInfo, NodeList
-from clueslib.request import JobInfo, Request
-from cpyutils.xmlobject import XMLObject_KW, XMLObject
-import cpyutils.evaluate
-import re
+from cpyutils.runcommand import runcommand
+
+from clueslib.platform import LRMS
+from clueslib.node import NodeInfo
+from cpyutils.evaluate import TypedClass, TypedList
 import collections
 
-try:
-    _annie
-except:
-    _annie = cpyutils.evaluate.Analyzer()
-
-# TODO: check if information about nodes is properly set (check properties, queues and so on)
 import cpyutils.log
 _LOGGER = cpyutils.log.Log("PLUGIN-PBS")
 
@@ -69,344 +61,83 @@ def _translate_mem_value(memval):
             
     return value * multiplier
 
-class _Nodespec:
-    # cadena="nodes=server:hippi+10:ppn=1:noserver+3:bigmem:hippi,walltime=10:00:00"
-    # Copied from clues-pbs-wrapper
-    # TODO: Merge in a unique location
-    
-    @staticmethod
-    def createFromOptions(request_str):
-        # resource = resource_expr , resource2 = resource_expr2
-        _nodes_requested = []
-        
-        requests = request_str.split(",")
-        
-        for resource_request in requests:
-            # resource = resource_expr
-            resource_request_a = resource_request.split("=", 1)
-            
-            if len(resource_request_a) == 2:
-                resource, resspec_str = resource_request_a
-                
-                if resource == 'nodes':
-                    # nodes = nodeset1 + nodeset2 + ... 
-                    nodespec_a = resspec_str.split("+")
-                    
-                    for nodespec_str in nodespec_a:
-                        # nodeset = {<node_count> | <hostname>} [:ppn=<ppn>][:gpus=<gpu>][:<property>[:<property>]...] [+ ...]
-                        nodespec_a = nodespec_str.split(":")
-                        if len(nodespec_a) > 0:
-                            nodestring = nodespec_a[0]
-                            nodename = None
-                            node_requested = _Nodespec()
-                            
-                            # {<node_count> | <hostname>}
-                            try:
-                                nodecount = int(nodestring)
-                                node_requested.nodecount = nodecount
-                            except:
-                                node_requested.nodecount = 1
-                                node_requested.hostname = nodestring
-                                
-                            # [:ppn=<ppn>][:gpus=<gpu>][:<property>[:<property>]...] [+ ...]
-                            for prop_str in nodespec_a[1:]:
-                                prop_a = prop_str.split("=", 1)
-                                if len(prop_a) == 1:
-                                    # <property>
-                                    node_requested.properties.append(prop_a[0])
-                                else:
-                                    # [:ppn=<ppn>][:gpus=<gpu>]
-                                    prop, val = prop_a
-                                    if prop == "ppn":
-                                        node_requested.ppn = val
-                                    elif prop == "gpus":
-                                        node_requested.gpus = val
-                                    else:
-                                        logging.warning("ignoring requested value for property %s" % prop)
-                            
-                            _nodes_requested.append(node_requested)
+
+# This function facilitates the parsing of the scontrol command exit
+def parse_scontrol(out):
+    out = out.decode()
+    if out.find("=") < 0: return []
+    r = []
+    for line in out.split("\n"):
+        line = line.strip()
+        if not line: continue
+        d = {}
+        while line:
+            item = ""
+            while "=" not in item:
+                split_val = line.rsplit(" ", 1)
+                # in the last case split_val only has 1 elem
+                elem = split_val[-1]
+                line = split_val[0] if len(split_val) == 2 else ""
+                if "=" not in item and item:
+                    item = "%s %s" % (elem, item)
                 else:
-                    # Other resources are ignored (e.g. walltime)
-                    # http://docs.adaptivecomputing.com/torque/4-1-3/Content/topics/2-jobs/requestingRes.htm
-                    logging.debug("ignoring resource %s" % resource)
-            else:
-                logging.debug("ignoring request %s" % resource_request)
-        
-        return _nodes_requested
-    
-    def to_request(self):
-        kws = ""
-        if self.hostname:
-            kws = "%shostname==\"%s\"" % (kws, self.hostname)
-        if self.queue:
-            if kws != "":
-                kws = "%s && " % kws
-            kws = "%s[\"%s\"] subset queues" % (kws, self.queue)
-        if self.properties:
-            comma_str = ""
-            p_str = ""
-            for p in self.properties:
-                p_str = "%s%s\"%s\"" % (p_str, comma_str, p)
-                comma_str = " , "
+                    item += elem
+            k,v = item.split("=", 1)
+            d[k] = v.strip()
+        r.append(d)
+    return r
 
-            if kws != "":
-                kws = "%s && " % kws
 
-            kws = "%s[%s] subset properties" % (kws, p_str)
-        if self.ppn:
-            # We are not checking whether the format is correct or not (numeric or not); that is a task of PBS
-            if kws != "":
-                kws = "%s && " % kws
-            kws = "%sppn>=%s" % (kws, self.ppn)
-        if self.gpus:
-            # We are not checking whether the format is correct or not (numeric or not); that is a task of PBS
-            if kws != "":
-                kws = "%s && " % kws
-            kws = "%sgpus>=%s" % (kws, self.gpus)
-        return kws
-    
-    def __init__(self):
-        self.ppn = None
-        self.gpus = None
-        self.properties = []
-        self.nodecount = None
-        self.hostname = None
-        self.queue = None
-        
-    def __str__(self):
-        if self.hostname is not None:
-            ret_str = self.hostname
-        elif self.nodecount is not None:
-            ret_str = str(self.nodecount)
-        if self.ppn is not None:
-            ret_str = "%s:ppn=%s" % (ret_str, self.ppn)
-        if self.gpus is not None:
-            ret_str = "%s:gpus=%s" % (ret_str, self.gpus)
-        for p in self.properties:
-            ret_str = "%s:%s" % (ret_str, p)
-        return ret_str
+# TODO: consider states in the second line of slurm
+# Function that translates the slurm node state into a valid clues2 node state
+def infer_clues_node_state(state):
+    # SLURM node states: "NoResp", "ALLOC", "ALLOCATED", "COMPLETING", "DOWN", "DRAIN", "ERROR, "FAIL", "FAILING", "FUTURE" "IDLE", 
+    #                "MAINT", "MIXED", "PERFCTRS/NPC", "RESERVED", "POWER_DOWN", "POWER_UP", "RESUME" or "UNDRAIN".
+    # CLUES2 node states: ERROR, UNKNOWN, IDLE, USED, OFF
+    res_state = ""
 
-class _Node(XMLObject):
-    values = [ 'name', 'state', 'ntype', 'status', 'np', 'properties', 'jobs' ]
-    numeric = [ 'np' ]
-    noneval = ""
-    
-    def to_nodeinfo(self):
-        # Transformation of the properties string to a keyword dictionary that would be used for further 
-        try:
-            # TODO: it seems that creating a lexer or a yacc is very slow, so we should get rid of this piece of code. We could simply recognice the pairs key=value
-            # _annie.clear_vars()
-            # _annie.check("hostname=\"%s\";ppn=%d;%s" % (self.name, self.slots_count, self.keywords))
-            # kw = _annie.get_vars()
-            kw = cpyutils.evaluate.vars_from_string("hostname=\"%s\";ppn=%d;%s" % (self.name, self.slots_count, self.keywords))
-        except:
-            _LOGGER.error("an error happened evaluating host information: 'hostname=\"%s\";%s'" % (self.name, self.keywords))
-            kw = {}
-        
-        ni = NodeInfo(self.name, self.slots_count, self.slots_free, self.memory_total, self.memory_free, kw)
-        ni.state = self._infer_clues_state()
-        return ni
+    if state == 'IDLE':
+        res_state = NodeInfo.IDLE
+    elif state == 'FAIL' or state == 'FAILING' or state == 'ERROR' or state == 'NoResp':
+        res_state = NodeInfo.ERROR
+    elif state == 'DOWN' or state == 'DRAIN' or state == 'MAINT':
+        res_state = NodeInfo.OFF
+    elif state == 'ALLOCATED' or state == 'ALLOC' or state == 'COMPLETING' or state == 'MIXED':
+        res_state = NodeInfo.USED
+    else:
+        res_state = NodeInfo.OFF
+        #res_state = NodeInfo.UNKNOWN
 
-    def _infer_clues_state(self):
-        res_state = ""
-        states = self.state.split(',')
-        
-        for state in states:
-            state = state.strip()
-            
-            if state == 'free': res_state = NodeInfo.IDLE
-            elif state == 'offline': res_state = NodeInfo.OFF
-            elif state == 'down': res_state = NodeInfo.OFF
-            elif state == 'job-exclusive' or state == 'busy' or state == 'reserve': res_state = NodeInfo.USED
-            else: res_state = NodeInfo.OFF
-            
-            # Si ya estamos en estado down, no seguimos mirando
-            if res_state == NodeInfo.OFF:
-                break;
-            
-        if (res_state == NodeInfo.IDLE) and (self.slots_count > self.slots_free):
-            res_state = NodeInfo.USED
-        
-        return res_state
+    return res_state
 
-    def __init__(self, xml_str, queues_properties):
-        XMLObject.__init__(self, xml_str)
-        
-        if self.np == "" or self.np < 0:
-            self.np = 1
+# Function that translates the slurm job state into a valid clues2 job state
+def infer_clues_job_state(state):
+    # a job can be in several states
+    # SLURM job states: CANCELLED, COMPLETED, CONFIGURING, COMPLETING, FAILED, NODE_FAIL, PENDING, PREEMPTED, RUNNING, SUSPENDED, TIMEOUT
+    # CLUES2 job states: ATTENDED o PENDING
+    res_state = ""
 
-        self.slots_count = self.np
-        self.properties = self.properties.split(',')
-        
-        self.queues = []
-        for prop in self.properties:
-            if prop in queues_properties:
-                self.queues += queues_properties[prop]
-        
-        # If there are queues that do not require properties, any node will be valid for the queue
-        if "" in queues_properties:
-            self.queues += queues_properties[""]
-                
-        keyw = self.status.split(',') # [ x for x in self.status.split(',') if x.strip() != "" ]
-        self.status_keywords = {}
-        # self.properties = {}
-        self.vars_str = ""
-        
-        for kw in keyw:
-            kv = kw.split('=', 1)
-            if len(kv) == 2:
-                k, v = kv
-                self.status_keywords[k] = v
-                if (v!="") and (re.match(r'^(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?(kb|gb|mb|tb|pb|Kb|Gb|Mb|Tb|Pb)?$', v) is None):
-                    self.vars_str = "%s%s=\"%s\";" % (self.vars_str, k, v)
-                else:
-                    self.vars_str = "%s%s=%s;" % (self.vars_str, k, v)
+    if state == 'PENDING':
+        res_state = clueslib.request.Request.PENDING
+    else:
+        res_state = clueslib.request.Request.ATTENDED
 
-        queues_str = ""
-        if len(self.queues) > 0:
-            queues_str = "\"%s\"" % "\",\"".join(self.queues)
-        self.keywords = "%squeues=[%s];" % (self.vars_str, queues_str)
+    return res_state
 
-        # TODO: check this code
-        if len(self.properties) > 0:
-            self.keywords = "%sproperties=[\"%s\"];" % (self.keywords, "\",\"".join(self.properties))
-        else:
-            self.keywords = "%sproperties=[];" % self.keywords
-    
-        n_jobs = 0
-        if self.jobs != "":
-            jobs = self.jobs.split(',')
-            n_jobs = len(jobs)
-            
-        # TODO: can be removed... just uses part of the original code structure
-        self.np = self.np - n_jobs
-        self.slots_free = self.np
-        
-        # Try to infer other values
-        self.memory_free = -1
-        self.memory_total = -1
-        
-        if 'totmem' in self.status_keywords:
-            self.memory_total = (_translate_mem_value(self.status_keywords['totmem']))
-            
-        if 'availmem' in self.status_keywords:
-            self.memory_free = (_translate_mem_value(self.status_keywords['availmem']))
-            
-            if self.memory_total == -1:
-                self.memory_total = self.memory_free
-        else:
-            self.memory_free = self.memory_total
+class lrms(LRMS):
 
-    def __str__(self):
-        return "<name>%s</name><np>%d</np><ntype>%s</ntype><status>%s</status><properties>%s</properties><keywords>%s</keywords>" % (self.name, self.np, self.ntype, self.status, ",".join(self.properties), self.keywords)
-
-class _PBSNodes(XMLObject):
-    tuples_lists = {'Node': _Node}
-
-    def __init__(self, xml_str, queues_properties):
-        XMLObject.__init__(self, xml_str, [queues_properties])
-
-class _Job(XMLObject):
-    values = [ 'Job_Id', 'job_state', 'nodes', 'queue', 'ctime', 'start_time' ]
-    noneval = ""
-    
-    def __init__(self, xml_str):
-        XMLObject.__init__(self, xml_str)
-        if not self.nodes:
-            self.nodes = "1"
-    
-    def __str__(self):
-        return "%s %s" % (self.Job_Id, self.nodes)
-       
-    def to_jobinfo(self):
-
-        nodespec = []
-        if self.nodes:
-            nodespec = _Nodespec.createFromOptions("nodes=" + self.nodes)
-        else:
-            ns = _Nodespec()
-            ns.nodecount=1
-            nodespec.queue = self.queue
-            nodespec.append(ns)
-        
-        req_str = []
-        for ns in nodespec:
-            req_str.append(ns.to_request())
-        if not req_str:
-            req_str.append("")
-        resources = clueslib.request.ResourcesNeeded(1, 0, req_str, taskcount = ns.nodecount)
-        ji = JobInfo(resources, self.Job_Id, [])
-        if self.job_state == "Q":
-            ji.set_state(Request.PENDING)
-        elif self.job_state in ["R","E","C","T"]:
-            ji.set_state(Request.SERVED)
-        elif self.job_state in ["H", "W"]:
-            ji.set_state(Request.BLOCKED)
-        else:
-            _LOGGER.error("The PBS job state '%s' is unknown" % self.job_state)
-            
-        return ji
-
-class _Jobs(XMLObject):
-    tuples_lists = {'Job': _Job}
-        
-class lrms(clueslib.platform.LRMS):
-    def _get_queues_properties(self):
-        # Changed with respect to CLUES 1, because it seems to be less prone to variations
-        command = self._qstat + [ '-Qf', "@%s" % self._server_ip ]
-        success, out_command = cpyutils.runcommand.runcommand(command, False, timeout = clueslib.configlib._CONFIGURATION_GENERAL.TIMEOUT_COMMANDS)
-        if not success:
-            _LOGGER.error("could not get information about the queues: %s" % out_command)
-            return None
-            
-        lines = out_command.split('\n')
-        
-        properties = {}
-        queue = None
-        properties_count = 0
-        for line in lines:
-            line = line.strip()
-            if line.find('Queue: ') != -1:
-                if queue is not None:
-                    if properties_count == 0:
-                        # The queue did not requested any property, so any node is valid for this queue
-                        if "" not in properties:
-                            properties[""] = []
-                        properties[""].append(queue)
-                
-                words = line.split(' ', 1)
-                queue = words[1].strip()
-                properties_count = 0
-                
-            elif line.find('resources_default.neednodes') != -1:
-                words = line.split('=', 1)
-                prop = words[1].strip()
-                
-                if prop not in properties:
-                    properties[prop] = []
-                    
-                if queue is not None:
-                    properties[prop].append(queue)
-                    
-                properties_count+=1
-
-        # When there are no more lines, we must check if the last queue requested no properties
-        if queue is not None:
-            if properties_count == 0:
-                # The queue did not requested any property, so any node is valid for this queue
-                if "" not in properties:
-                    properties[""] = []
-                properties[""].append(queue)
-                    
-        return properties
-
+    #def __init__(self, SLURM_SERVER = None, SLURM_PARTITION_COMMAND = None, SLURM_NODES_COMMAND = None, SLURM_JOBS_COMMAND = None):
     def __init__(self, PBS_SERVER = None, PBS_QSTAT_COMMAND = None, PBS_PBSNODES_COMMAND = None): # PBS_PATH = None):
-        #
-        # NOTE: This fragment provides the support for global config files. It is a bit awful.
-        #       I do not like it because it is like having global vars. But it is managed in
-        #       this way for the sake of using configuration files
-        #
         import cpyutils.config
+        #config_slurm = cpyutils.config.Configuration(
+        #    "SLURM",
+        #    {
+        #        "SLURM_SERVER": "slurmserverpublic", 
+        #        "SLURM_PARTITION_COMMAND": "/usr/local/bin/scontrol -o show partitions",
+        #        "SLURM_NODES_COMMAND": "/usr/local/bin/scontrol -o show nodes",
+        #        "SLURM_JOBS_COMMAND": "/usr/local/bin/scontrol -o show jobs"
+        #    }
+        #)
         config_pbs = cpyutils.config.Configuration(
             "PBS",
             {
@@ -416,61 +147,198 @@ class lrms(clueslib.platform.LRMS):
             }
         )
         
+        #self._server_ip = clueslib.helpers.val_default(SLURM_SERVER, config_slurm.SLURM_SERVER)
+        #self._partition  = clueslib.helpers.val_default(SLURM_PARTITION_COMMAND, config_slurm.SLURM_PARTITION_COMMAND)
+        #self._nodes = clueslib.helpers.val_default(SLURM_NODES_COMMAND, config_slurm.SLURM_NODES_COMMAND)
+        #self._jobs = clueslib.helpers.val_default(SLURM_JOBS_COMMAND, config_slurm.SLURM_JOBS_COMMAND)
+        #clueslib.platform.LRMS.__init__(self, "SLURM_%s" % self._server_ip)
+        
         self._server_ip = clueslib.helpers.val_default(PBS_SERVER, config_pbs.PBS_SERVER)
         _qstat_cmd = clueslib.helpers.val_default(PBS_QSTAT_COMMAND, config_pbs.PBS_QSTAT_COMMAND)
         self._qstat = _qstat_cmd.split(" ")
         _pbsnodes_cmd = clueslib.helpers.val_default(PBS_PBSNODES_COMMAND, config_pbs.PBS_PBSNODES_COMMAND)
         self._pbsnodes = _pbsnodes_cmd.split(" ")
         clueslib.platform.LRMS.__init__(self, "PBS_%s" % self._server_ip)
-        
-    def get_nodeinfolist(self):
-        queues_properties = self._get_queues_properties()
 
-        if queues_properties is None:
-            _LOGGER.error("could not obtain information about the queues from PBS server %s (check if it is online and the user running CLUES is allowed to poll the queues)" % self._server_ip)
+    # Function that recovers the partitions of a node
+    # A node can be in several queues: SLURM has supported configuring nodes in more than one partition since version 0.7.0
+    def _get_partition(self, node_name):
+
+        '''Exit example of scontrol show partitions: 
+        PartitionName=wn
+        AllowGroups=ALL AllowAccounts=ALL AllowQos=ALL
+        AllocNodes=ALL Default=NO
+        DefaultTime=NONE DisableRootJobs=NO GraceTime=0 Hidden=NO
+        MaxNodes=UNLIMITED MaxTime=UNLIMITED MinNodes=1 LLN=NO MaxCPUsPerNode=UNLIMITED
+        Nodes=wn[0-4]
+        Priority=1 RootOnly=NO ReqResv=NO Shared=NO PreemptMode=OFF
+        State=UP TotalCPUs=5 TotalNodes=5 SelectTypeParameters=N/A
+        DefMemPerNode=UNLIMITED MaxMemPerNode=UNLIMITED'''
+        
+        res_queue = []
+        exit = ""
+
+        try:
+            command = self._pbsnodes + [ '-av', '-S', '-L', '-F json', self._server_ip ]
+            #success, out = runcommand(command)
+            success, out_command = cpyutils.runcommand.runcommand(command, False, timeout = clueslib.configlib._CONFIGURATION_GENERAL.TIMEOUT_COMMANDS)
+            if not success:
+                _LOGGER.error("could not get information about the queues: %s" % out_command)
+                return None
+            else:
+                exit = parse_scontrol(out)
+        except Exception as ex:
+            _LOGGER.error("could not obtain information about SLURM partitions %s (%s)" % (self._server_ip, exit))
             return None
         
-        command = self._pbsnodes + [ '-a','-F','json', '-s', self._server_ip ]
-        success, out_command = cpyutils.runcommand.runcommand(command, False, timeout = clueslib.configlib._CONFIGURATION_GENERAL.TIMEOUT_COMMANDS)
-        out_command = dicttoxml.dicttoxml(out_command)
+        if exit:
+            for key in exit:
+                nodes = str(key["Nodes"])
+                if nodes == node_name:
+                    #nodes is like wn1
+                    res_queue.append(key["PartitionName"])
+                else:
+                    #nodes is like wnone-[0-1]
+                    pos1 = nodes.find("[")
+                    pos2 = nodes.find("]")
+                    pos3 = nodes.find("-", pos1)
+                    if pos1 > -1 and pos2 > -1 and pos3 > -1:
+                        num1 = int(nodes[pos1+1:pos3])
+                        num2 = int(nodes[pos3+1:pos2])
+                        name = nodes[:pos1]
+                        while num1 <= num2:
+                            nodename = name + str(num1)
+                            if nodename == node_name:
+                                res_queue.append(key["PartitionName"])
+                                break;
+                            num1 = num1 + 1
 
-        if not success:
-            _LOGGER.error("could not obtain information about PBS server %s (%s)" % (self._server_ip, out_command))
-            return None
-            
-        hosts = _PBSNodes(out_command, queues_properties)
+        return res_queue
+
+    def get_nodeinfolist(self):      
         nodeinfolist = collections.OrderedDict()
         
-        if hosts is not None:
-            for host in hosts.Node:
-                nodeinfolist[host.name] = host.to_nodeinfo()
-        else:
-            _LOGGER.warning("an error occurred when monitoring hosts (could not get information from PBS; please check PBS_SERVER and PBS_PBSNODES_COMMAND vars)")
-                
-        return nodeinfolist
-    
-    def get_jobinfolist(self):
-        command = self._qstat + [ '-x', '@%s' % self._server_ip ]
+        '''Exit example of scontrol show nodes
+        NodeName=wn0 Arch=x86_64 CoresPerSocket=1
+        CPUAlloc=0 CPUErr=0 CPUTot=1 CPULoad=0.02 Features=(null)
+        Gres=(null)
+        NodeAddr=wn0 NodeHostName=wn0 Version=14.11
+        OS=Linux RealMemory=1 AllocMem=0 Sockets=1 Boards=1
+        State=IDLE ThreadsPerCore=1 TmpDisk=0 Weight=1
+        BootTime=2015-04-28T13:12:21 SlurmdStartTime=2015-04-28T13:16:32
+        CurrentWatts=0 LowestJoules=0 ConsumedJoules=0
+        ExtSensorsJoules=n/s ExtSensorsWatts=0 ExtSensorsTemp=n/s'''
+
+
+        command = self._pbsnodes + [ '-av', '-S', '-L', '-F json', self._server_ip ]
         success, out_command = cpyutils.runcommand.runcommand(command, False, timeout = clueslib.configlib._CONFIGURATION_GENERAL.TIMEOUT_COMMANDS)
-
         if not success:
-            _LOGGER.error("could not obtain information about PBS server %s (%s)" % (self._server_ip, out_command))
+            #_LOGGER.error("could not obtain information about SLURM nodes %s (command rc != 0)" % self._server_ip)
+            _LOGGER.error("could not get information about the queues: %s" % out_command)
             return None
+        out_command_json = json.loads(out_command.encode())
         
+        
+        
+        
+        if exit:
+            for key in exit:
+                try:
+                    name = str(key["NodeName"])
+                    slots_count = int(key["CPUTot"])
+                    slots_free = int(key["CPUTot"]) - int(key["CPUAlloc"])
+                    #NOTE: memory is in GB
+                    memory_total = _translate_mem_value(key["RealMemory"] + ".GB")
+                    memory_free = _translate_mem_value(key["RealMemory"] + ".GB") - _translate_mem_value(key["AllocMem"] + ".GB")
+                    state = infer_clues_node_state(str(key["State"]))
+                    keywords = {}
+                    queues = self._get_partition(name)
+                    keywords['hostname'] = TypedClass.auto(name)
+                    if queues:
+                        keywords['queues'] = TypedList([TypedClass.auto(q) for q in queues])
+                        
+                    nodeinfolist[name] = NodeInfo(name, slots_count, slots_free, memory_total, memory_free, keywords)
+                    nodeinfolist[name].state = state
+                except:
+                    _LOGGER.error("Error adding node: %s." % key)
+
+        return nodeinfolist
+
+    # Method in charge of monitoring the job queue of SLURM
+    def get_jobinfolist(self):
+
+        '''Exit example of scontrol -o show jobs:
+        JobId=3 JobName=pr.sh
+        UserId=ubuntu(1000) GroupId=ubuntu(1000)
+        Priority=4294901758 Nice=0 Account=(null) QOS=(null)
+        JobState=RUNNING Reason=None Dependency=(null)
+        Requeue=0 Restarts=0 BatchFlag=1 Reboot=0 ExitCode=0:0
+        RunTime=00:00:00 TimeLimit=UNLIMITED TimeMin=N/A
+        SubmitTime=2015-05-13T12:34:57 EligibleTime=2015-05-13T12:34:57
+        StartTime=2015-05-13T12:34:58 EndTime=Unknown
+        PreemptTime=None SuspendTime=None SecsPreSuspend=0
+        Partition=wn AllocNode:Sid=slurmserverpublic:1135
+        ReqNodeList=(null) ExcNodeList=(null)
+        NodeList=wn2
+        BatchHost=wn2
+        NumNodes=1 NumCPUs=1 CPUs/Task=1 ReqB:S:C:T=0:0:*:*
+        Socks/Node=* NtasksPerN:B:S:C=0:0:*:* CoreSpec=*
+        MinCPUsNode=1 MinMemoryNode=0 MinTmpDiskNode=0
+        Features=(null) Gres=(null) Reservation=(null)
+        Shared=0 Contiguous=0 Licenses=(null) Network=(null)
+        Command=/home/ubuntu/pr.sh
+        WorkDir=/home/ubuntu
+        StdErr=/home/ubuntu/slurm-3.out
+        StdIn=/dev/null
+        StdOut=/home/ubuntu/slurm-3.out'''
+
+        exit = " "
         jobinfolist = []
-        if out_command.strip():
-            jobs = _Jobs(out_command)
-            
-            if jobs is not None:
-                for job in jobs.Job:
-                    # Do not return running or finished jobs
-                    job_info = job.to_jobinfo()
-                    if job_info.state != Request.SERVED:
-                        jobinfolist.append(job_info)
+
+        try:
+            success, out = runcommand(self._jobs)
+            if not success:
+                _LOGGER.error("could not obtain information about SLURM jobs %s (command rc != 0)" % self._server_ip)
+                return None
             else:
-                _LOGGER.warning("an error occurred when monitoring hosts (could not get information from PBS; please check PBS_SERVER and PBS_QSTAT_COMMAND vars)")
+                exit = parse_scontrol(out)
+        except:
+            _LOGGER.error("could not obtain information about SLURM jobs %s (%s)" % (self._server_ip, exit))
+            return None
 
+        if exit:
+            for job in exit:
+                try:
+                    job_id = str(job["JobId"])
+                    state = infer_clues_job_state(str(job["JobState"]))
+                    nodes = []
+                    # ReqNodeList is also available
+                    if str(job["NodeList"]) != "(null)":
+                        nodes.append(str(job["NodeList"]))
+                    if len(job["NumNodes"]) > 1:
+                        numnodes = int(job["NumNodes"][:1])
+                    else:
+                        numnodes = int(job["NumNodes"])
+                    # It seems that in some cases MinMemoryNode does not appear
+                    if 'MinMemoryNode' in job:
+                        memory = _translate_mem_value(job["MinMemoryNode"] + ".MB")
+                    else:
+                        memory = 0
+                    if 'NumTasks' in job:
+                        numtasks = int(job["NumTasks"])
+                    else:
+                        numtasks = numnodes
+                    cpus_per_task = int(job["CPUs/Task"])
+                    partition = '"' + str(job["Partition"]) + '" in queues'
+    
+                    resources = clueslib.request.ResourcesNeeded(cpus_per_task, memory, [partition], numtasks)
+                    j = clueslib.request.JobInfo(resources, job_id, nodes)
+                    j.set_state(state)
+                    jobinfolist.append(j)
+                except:
+                    _LOGGER.error("Error processing job: %s." % job)
+        
         return jobinfolist
-
+        
 if __name__ == '__main__':
     pass
