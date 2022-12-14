@@ -90,24 +90,26 @@ def parse_scontrol(out):
 
 # TODO: consider states in the second line of slurm
 # Function that translates the slurm node state into a valid clues2 node state
-def infer_clues_node_state(state):
-    # SLURM node states: "NoResp", "ALLOC", "ALLOCATED", "COMPLETING", "DOWN", "DRAIN", "ERROR, "FAIL", "FAILING", "FUTURE" "IDLE", 
-    #                "MAINT", "MIXED", "PERFCTRS/NPC", "RESERVED", "POWER_DOWN", "POWER_UP", "RESUME" or "UNDRAIN".
-    # CLUES2 node states: ERROR, UNKNOWN, IDLE, USED, OFF
+def infer_clues_node_state(state,slots_count,slots_free):
     res_state = ""
-
-    if state == 'IDLE':
-        res_state = NodeInfo.IDLE
-    elif state == 'FAIL' or state == 'FAILING' or state == 'ERROR' or state == 'NoResp':
-        res_state = NodeInfo.ERROR
-    elif state == 'DOWN' or state == 'DRAIN' or state == 'MAINT':
-        res_state = NodeInfo.OFF
-    elif state == 'ALLOCATED' or state == 'ALLOC' or state == 'COMPLETING' or state == 'MIXED':
-        res_state = NodeInfo.USED
-    else:
-        res_state = NodeInfo.OFF
-        #res_state = NodeInfo.UNKNOWN
-
+    states = state.split(',')
+    
+    for state in states:
+        state = state.strip()
+        
+        if state == 'free': res_state = NodeInfo.IDLE
+        elif state == 'offline': res_state = NodeInfo.OFF
+        elif state == 'down': res_state = NodeInfo.OFF
+        elif state == 'job-exclusive' or state == 'busy' or state == 'reserve': res_state = NodeInfo.USED
+        else: res_state = NodeInfo.OFF
+       
+        # Si ya estamos en estado down, no seguimos mirando
+        if res_state == NodeInfo.OFF:
+            break;
+            
+        if (res_state == NodeInfo.IDLE) and (slots_count > slots_free):
+            res_state = NodeInfo.USED
+        
     return res_state
 
 # Function that translates the slurm job state into a valid clues2 job state
@@ -230,7 +232,7 @@ class lrms(LRMS):
         ExtSensorsJoules=n/s ExtSensorsWatts=0 ExtSensorsTemp=n/s'''
 
 
-        command = self._pbsnodes + [ '-av', '-S', '-L', '-F json', self._server_ip ]
+        command = self._pbsnodes + [ '-av', '-S', '-L', '-F json', '-s', self._server_ip ]
         success, out_command = cpyutils.runcommand.runcommand(command, False, timeout = clueslib.configlib._CONFIGURATION_GENERAL.TIMEOUT_COMMANDS)
         if not success:
             #_LOGGER.error("could not obtain information about SLURM nodes %s (command rc != 0)" % self._server_ip)
@@ -241,18 +243,31 @@ class lrms(LRMS):
         
         
         
-        if exit:
-            for key in exit:
+        if out_command_json:
+            for key in out_command_json["nodes"]:
                 try:
-                    name = str(key["NodeName"])
-                    slots_count = int(key["CPUTot"])
-                    slots_free = int(key["CPUTot"]) - int(key["CPUAlloc"])
+                    name = str(key)
+                    slots_count = 0
+                    if "ncpus" in out_command_json["nodes"][key]["resources_available"]: 
+                        slots_count = int(out_command_json["nodes"][key]["resources_available"]["ncpus"])
+                    slots_ass = 0
+                    if "ncpus" in out_command_json["nodes"][key]["resources_assigned"]: 
+                        slots_ass = int(out_command_json["nodes"][key]["resources_assigned"]["ncpus"])
+                    slots_free = slots_count - slots_ass
                     #NOTE: memory is in GB
-                    memory_total = _translate_mem_value(key["RealMemory"] + ".GB")
-                    memory_free = _translate_mem_value(key["RealMemory"] + ".GB") - _translate_mem_value(key["AllocMem"] + ".GB")
-                    state = infer_clues_node_state(str(key["State"]))
+                    memory_total = 0
+                    if "mem" in out_command_json["nodes"][key]["resources_available"]: 
+                        memory_total = str(out_command_json["nodes"][key]["resources_available"]["mem"])
+                    memory_ass = 0
+                    if "mem" in out_command_json["nodes"][key]["resources_assigned"]: 
+                        memory_ass = str(out_command_json["nodes"][key]["resources_assigned"]["mem"])
+                    memory_total = _translate_mem_value(memory_total + ".GB")
+                    memory_free = _translate_mem_value(memory_total + ".GB") - _translate_mem_value(memory_ass + ".GB")
+                    state = infer_clues_node_state(str(out_command_json["nodes"][key]["state"]),slots_count,slots_free)
                     keywords = {}
-                    queues = self._get_partition(name)
+                    queues = ""
+                    if "queue" in out_command_json["nodes"][key]: 
+                        queues = out_command_json["nodes"][key]["queue"]
                     keywords['hostname'] = TypedClass.auto(name)
                     if queues:
                         keywords['queues'] = TypedList([TypedClass.auto(q) for q in queues])
