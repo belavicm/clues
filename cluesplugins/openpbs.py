@@ -291,7 +291,7 @@ class lrms(LRMS):
 
         out_command_json = json.loads(out_command.decode())
         jobinfolist = []
-        if out_command_json:
+        if out_command_json and "Jobs" in out_command_json:
             for job in out_command_json["Jobs"]:
                 try:
                     job_id = str(job)
