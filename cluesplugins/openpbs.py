@@ -282,7 +282,7 @@ class lrms(LRMS):
     # Method in charge of monitoring the job queue of SLURM
     def get_jobinfolist(self):
 
-        command = self._qstat + [ '-f','-F json' '@%s' % self._server_ip ]
+        command = self._qstat + [ '-f','-F json', '@%s' % self._server_ip ]
         success, out_command = cpyutils.runcommand.runcommand(command, False, timeout = clueslib.configlib._CONFIGURATION_GENERAL.TIMEOUT_COMMANDS)
 
         if not success:
