@@ -317,7 +317,7 @@ class lrms(LRMS):
                     #    numtasks = numnodes
                     #cpus_per_task = int(job["CPUs/Task"])
                     numtasks = int(out_command_json["Jobs"][job]["resources_used"]["ncpus"])
-                    partition = '"' + str(out_command_json["Jobs"][job]"queue"]) + '" in queues'
+                    partition = '"' + str(out_command_json["Jobs"][job]["queue"]) + '" in queues'
     
                     resources = clueslib.request.ResourcesNeeded(cpus_per_task, memory, [partition], numtasks)
                     j = clueslib.request.JobInfo(resources, job_id, nodes)
