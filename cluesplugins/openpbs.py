@@ -119,7 +119,7 @@ def infer_clues_job_state(state):
     # CLUES2 job states: ATTENDED o PENDING
     res_state = ""
 
-    if state == 'PENDING':
+    if state == 'Q':
         res_state = clueslib.request.Request.PENDING
     else:
         res_state = clueslib.request.Request.ATTENDED
