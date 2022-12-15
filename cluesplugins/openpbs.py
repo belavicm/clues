@@ -232,7 +232,7 @@ class lrms(LRMS):
         ExtSensorsJoules=n/s ExtSensorsWatts=0 ExtSensorsTemp=n/s'''
 
 
-        command = self._pbsnodes + [ '-av', '-S', '-L', '-F json', '-s', self._server_ip ]
+        command = self._pbsnodes + [ '-av', '-F json', '-s', self._server_ip ]
         success, out_command = cpyutils.runcommand.runcommand(command, False, timeout = clueslib.configlib._CONFIGURATION_GENERAL.TIMEOUT_COMMANDS)
         if not success:
             #_LOGGER.error("could not obtain information about SLURM nodes %s (command rc != 0)" % self._server_ip)
@@ -282,69 +282,42 @@ class lrms(LRMS):
     # Method in charge of monitoring the job queue of SLURM
     def get_jobinfolist(self):
 
-        '''Exit example of scontrol -o show jobs:
-        JobId=3 JobName=pr.sh
-        UserId=ubuntu(1000) GroupId=ubuntu(1000)
-        Priority=4294901758 Nice=0 Account=(null) QOS=(null)
-        JobState=RUNNING Reason=None Dependency=(null)
-        Requeue=0 Restarts=0 BatchFlag=1 Reboot=0 ExitCode=0:0
-        RunTime=00:00:00 TimeLimit=UNLIMITED TimeMin=N/A
-        SubmitTime=2015-05-13T12:34:57 EligibleTime=2015-05-13T12:34:57
-        StartTime=2015-05-13T12:34:58 EndTime=Unknown
-        PreemptTime=None SuspendTime=None SecsPreSuspend=0
-        Partition=wn AllocNode:Sid=slurmserverpublic:1135
-        ReqNodeList=(null) ExcNodeList=(null)
-        NodeList=wn2
-        BatchHost=wn2
-        NumNodes=1 NumCPUs=1 CPUs/Task=1 ReqB:S:C:T=0:0:*:*
-        Socks/Node=* NtasksPerN:B:S:C=0:0:*:* CoreSpec=*
-        MinCPUsNode=1 MinMemoryNode=0 MinTmpDiskNode=0
-        Features=(null) Gres=(null) Reservation=(null)
-        Shared=0 Contiguous=0 Licenses=(null) Network=(null)
-        Command=/home/ubuntu/pr.sh
-        WorkDir=/home/ubuntu
-        StdErr=/home/ubuntu/slurm-3.out
-        StdIn=/dev/null
-        StdOut=/home/ubuntu/slurm-3.out'''
+        command = self._qstat + [ '-f','-F json' '@%s' % self._server_ip ]
+        success, out_command = cpyutils.runcommand.runcommand(command, False, timeout = clueslib.configlib._CONFIGURATION_GENERAL.TIMEOUT_COMMANDS)
 
-        exit = " "
-        jobinfolist = []
-
-        try:
-            success, out = runcommand(self._jobs)
-            if not success:
-                _LOGGER.error("could not obtain information about SLURM jobs %s (command rc != 0)" % self._server_ip)
-                return None
-            else:
-                exit = parse_scontrol(out)
-        except:
-            _LOGGER.error("could not obtain information about SLURM jobs %s (%s)" % (self._server_ip, exit))
+        if not success:
+            _LOGGER.error("could not obtain information about PBS server %s (%s)" % (self._server_ip, out_command))
             return None
 
-        if exit:
-            for job in exit:
+        out_command_json = json.loads(out_command)
+        jobinfolist = []
+        if out_command_json:
+            for job in out_command_json["Jobs"]:
                 try:
-                    job_id = str(job["JobId"])
-                    state = infer_clues_job_state(str(job["JobState"]))
+                    job_id = str(job)
+                    state = infer_clues_job_state(str(out_command_json["Jobs"][job]["job_state"]))
                     nodes = []
+                    memory = 0
+                    cpus_per_task = 1
                     # ReqNodeList is also available
-                    if str(job["NodeList"]) != "(null)":
-                        nodes.append(str(job["NodeList"]))
-                    if len(job["NumNodes"]) > 1:
-                        numnodes = int(job["NumNodes"][:1])
-                    else:
-                        numnodes = int(job["NumNodes"])
-                    # It seems that in some cases MinMemoryNode does not appear
-                    if 'MinMemoryNode' in job:
-                        memory = _translate_mem_value(job["MinMemoryNode"] + ".MB")
-                    else:
-                        memory = 0
-                    if 'NumTasks' in job:
-                        numtasks = int(job["NumTasks"])
-                    else:
-                        numtasks = numnodes
-                    cpus_per_task = int(job["CPUs/Task"])
-                    partition = '"' + str(job["Partition"]) + '" in queues'
+                    #if str(job["NodeList"]) != "(null)":
+                    #    nodes.append(str(job["NodeList"]))
+                    #if len(job["NumNodes"]) > 1:
+                    #    numnodes = int(job["NumNodes"][:1])
+                    #else:
+                    #    numnodes = int(job["NumNodes"])
+                    ## It seems that in some cases MinMemoryNode does not appear
+                    #if 'MinMemoryNode' in job:
+                    #    memory = _translate_mem_value(job["MinMemoryNode"] + ".MB")
+                    #else:
+                    #    memory = 0
+                    #if 'NumTasks' in job:
+                    #    numtasks = int(job["NumTasks"])
+                    #else:
+                    #    numtasks = numnodes
+                    #cpus_per_task = int(job["CPUs/Task"])
+                    numtasks = int(out_command_json["Jobs"][job]["resources_used"]["ncpus"])
+                    partition = '"' + str(out_command_json["Jobs"][job]"queue"]) + '" in queues'
     
                     resources = clueslib.request.ResourcesNeeded(cpus_per_task, memory, [partition], numtasks)
                     j = clueslib.request.JobInfo(resources, job_id, nodes)
