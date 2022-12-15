@@ -255,14 +255,14 @@ class lrms(LRMS):
                         slots_ass = int(out_command_json["nodes"][key]["resources_assigned"]["ncpus"])
                     slots_free = slots_count - slots_ass
                     #NOTE: memory is in GB
-                    memory_total = 0
+                    memory_total = "0kb"
                     if "mem" in out_command_json["nodes"][key]["resources_available"]: 
                         memory_total = str(out_command_json["nodes"][key]["resources_available"]["mem"])
-                    memory_ass = 0
+                    memory_ass = "0kb"
                     if "mem" in out_command_json["nodes"][key]["resources_assigned"]: 
                         memory_ass = str(out_command_json["nodes"][key]["resources_assigned"]["mem"])
-                    memory_total = _translate_mem_value(memory_total + ".GB")
-                    memory_free = _translate_mem_value(memory_total + ".GB") - _translate_mem_value(memory_ass + ".GB")
+                    memory_total = _translate_mem_value(memory_total)
+                    memory_free = memory_total - _translate_mem_value(memory_ass)
                     state = infer_clues_node_state(str(out_command_json["nodes"][key]["state"]),slots_count,slots_free)
                     keywords = {}
                     queues = ""
