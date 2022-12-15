@@ -232,13 +232,13 @@ class lrms(LRMS):
         ExtSensorsJoules=n/s ExtSensorsWatts=0 ExtSensorsTemp=n/s'''
 
 
-        command = self._pbsnodes + [ '-av', '-F json', '-s', self._server_ip ]
+        command = self._pbsnodes + [ '-av', '-F', 'json', '-s', self._server_ip ]
         success, out_command = cpyutils.runcommand.runcommand(command, False, timeout = clueslib.configlib._CONFIGURATION_GENERAL.TIMEOUT_COMMANDS)
         if not success:
             #_LOGGER.error("could not obtain information about SLURM nodes %s (command rc != 0)" % self._server_ip)
             _LOGGER.error("could not get information about the queues: %s" % out_command)
             return None
-        out_command_json = json.loads(out_command.encode())
+        out_command_json = json.loads(out_command.decode())
         
         
         
@@ -282,14 +282,14 @@ class lrms(LRMS):
     # Method in charge of monitoring the job queue of SLURM
     def get_jobinfolist(self):
 
-        command = self._qstat + [ '-f','-F json', '@%s' % self._server_ip ]
+        command = self._qstat + [ '-f','-F', 'json', '@%s' % self._server_ip ]
         success, out_command = cpyutils.runcommand.runcommand(command, False, timeout = clueslib.configlib._CONFIGURATION_GENERAL.TIMEOUT_COMMANDS)
 
         if not success:
             _LOGGER.error("could not obtain information about PBS server %s (%s)" % (self._server_ip, out_command))
             return None
 
-        out_command_json = json.loads(out_command)
+        out_command_json = json.loads(out_command.decode())
         jobinfolist = []
         if out_command_json:
             for job in out_command_json["Jobs"]:
