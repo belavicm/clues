@@ -100,7 +100,7 @@ def infer_clues_node_state(state,slots_count,slots_free):
         if state == 'free': res_state = NodeInfo.IDLE
         elif state == 'offline': res_state = NodeInfo.OFF
         elif state == 'down': res_state = NodeInfo.OFF
-        elif state == 'job-exclusive' or state == 'busy' or state == 'reserve': res_state = NodeInfo.USED
+        elif state == 'job-exclusive' or state == 'busy' or state == 'job-busy' or state == 'reserve' or state == 'job-reserve': res_state = NodeInfo.USED
         else: res_state = NodeInfo.OFF
        
         # Si ya estamos en estado down, no seguimos mirando
